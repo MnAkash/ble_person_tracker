@@ -47,6 +47,7 @@
 static constexpr int LED_PIN         = 12;    // adjust to your board
 static constexpr int AP_TRIGGER_PIN  = 2;     // hold LOW to enter AP
 static constexpr uint32_t AP_HOLD_MS = 1000;  // 1s press
+static time_t ts_unix_last_sensor_update = 0; // last unix timestamp when sensor data was sent
 
 // Admin token: used ONLY to authorize saves; never stored in NVS
 static const char* ADMIN_TOKEN = "123456";
@@ -55,7 +56,7 @@ static const char* ADMIN_TOKEN = "123456";
 struct Config {
   char ssid[32]       = "ssid";
   char pass[64]       = "pass";
-  char mqttHost[64]   = "10.0.0.169";
+  char mqttHost[64]   = "192.168.50.237";
   uint16_t mqttPort   = 1883;
   char deviceID[32]   = "BS1";
   char macList[160]   = "dd:88:00:00:13:07"; // lower-case, comma-separated
@@ -373,22 +374,65 @@ static void startMDNS() {
 }
 
 // ===================== MQTT =====================
-static void mqttConnect() {
+
+unsigned long g_nextMqttRetryMs = 0;
+uint8_t g_mqttRetries = 0;
+
+const char* mqttStateStr(int s){
+  switch(s){
+    case MQTT_CONNECTION_TIMEOUT:      return "CONNECTION_TIMEOUT";
+    case MQTT_CONNECTION_LOST:         return "CONNECTION_LOST";
+    case MQTT_CONNECT_FAILED:          return "CONNECT_FAILED";
+    case MQTT_DISCONNECTED:            return "DISCONNECTED";
+    case MQTT_CONNECTED:               return "CONNECTED";
+    case MQTT_CONNECT_BAD_PROTOCOL:    return "BAD_PROTOCOL";
+    case MQTT_CONNECT_BAD_CLIENT_ID:   return "BAD_CLIENT_ID";
+    case MQTT_CONNECT_UNAVAILABLE:     return "SERVER_UNAVAILABLE";
+    case MQTT_CONNECT_BAD_CREDENTIALS: return "BAD_CREDENTIALS";
+    case MQTT_CONNECT_UNAUTHORIZED:    return "UNAUTHORIZED";
+    default:                           return "UNKNOWN";
+  }
+}
+
+void mqttConnectRobust() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  const unsigned long now = millis();
+  if (now < g_nextMqttRetryMs) return;   // wait until next backoff slot
+
   mqtt.setServer(cfg.mqttHost, cfg.mqttPort);
   mqtt.setKeepAlive(30);
   mqtt.setBufferSize(512);
   std::string clientId  = std::string("ble-") + cfg.deviceID;
   std::string willTopic = std::string("sensors/ble/") + cfg.deviceID + "/status";
-#if DEBUG_NET
-  Serial.printf("[MQTT] Connecting to %s:%u\n", cfg.mqttHost, cfg.mqttPort);
-#endif
-  while (!mqtt.connected()) {
-    mqtt.connect(clientId.c_str(), NULL, NULL, willTopic.c_str(), 0, true, "offline");
-    if (!mqtt.connected()) { Serial.print("!"); delay(800); }
+
+  // Close any half-open TCP before new attempt
+  wifiClient.stop();
+
+  Serial.printf("[MQTT] Connecting to %s:%u as %s\n", cfg.mqttHost, cfg.mqttPort, clientId.c_str());
+
+  bool ok = mqtt.connect(clientId.c_str(),
+                         /*willTopic*/ willTopic.c_str(), /*willQos*/ 0, /*willRetain*/ true,
+                         /*willMessage*/ "offline");
+
+  if (!ok) {
+    int st = mqtt.state();
+    Serial.printf("[MQTT] connect failed: state=%d (%s)\n", st, mqttStateStr(st));
+    // Backoff: 0.5s,1s,2s,... up to 60s
+    g_mqttRetries = (g_mqttRetries < 8) ? g_mqttRetries + 1 : 8;
+    unsigned long delayMs = 500UL * (1UL << (g_mqttRetries - 1));
+    if (delayMs > 60000UL) delayMs = 60000UL;
+    g_nextMqttRetryMs = now + delayMs;
+    return;
   }
+
+  // Success
+  g_mqttRetries = 0;
+  g_nextMqttRetryMs = 0;
   mqtt.publish(willTopic.c_str(), "online", true);
-  Serial.println("\n[MQTT] Connected");
+  Serial.println("[MQTT] connected.");
 }
+
 
 // ===================== BLE scanning =====================
 static std::vector<std::string> targetMacs;
@@ -407,6 +451,8 @@ class ScanCB : public NimBLEScanCallbacks {
     int rssi = adv->getRSSI();
     auto &st = states[mac];
     if (isnan(st.rssi_ema)) st.rssi_ema = rssi; else st.rssi_ema = 0.3f * rssi + 0.7f * st.rssi_ema;
+
+    ts_unix_last_sensor_update = nowUnix();
 
     uint32_t t = millis();
     if (t - st.lastPubMs < cfg.pubMs) return;
@@ -433,7 +479,13 @@ class ScanCB : public NimBLEScanCallbacks {
     Serial.println();
 #endif
 
-    mqtt.publish(topic.c_str(), (const uint8_t*)buf, (unsigned int)n);
+    bool pubOK = mqtt.publish(topic.c_str(), (const uint8_t*)buf, (unsigned int)n);
+    if (!pubOK) {
+      Serial.println("[MQTT] publish failed; scheduling reconnect");
+      mqtt.disconnect();
+      g_nextMqttRetryMs = 0;  // allow immediate retry
+    }
+
     st.lastPubMs = t;
   }
 };
@@ -443,9 +495,10 @@ static void startBLE() {
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   NimBLEScan* scan = NimBLEDevice::getScan();
-  scan->setActiveScan(true);
-  scan->setInterval(45);
-  scan->setWindow(45);
+  scan->setActiveScan(false); // setting true will send a request to broadcaster
+  scan->setInterval(100);
+  scan->setWindow(40);
+  scan->setMaxResults(0); // don't store results in RAM, callbacks only
   scan->setDuplicateFilter(false);
   scan->setScanCallbacks(&scanCb, /*wantDuplicates=*/true);
   scan->start(0, false, false);  // forever
@@ -483,7 +536,6 @@ void setup() {
         return;
     }
 
-    setupTime();
 
     // Parse MAC list into vector<string>
     targetMacs.clear();
@@ -500,6 +552,7 @@ void setup() {
     }
 
     Serial.printf("Wi-Fi OK, IP=%s\n", WiFi.localIP().toString().c_str());
+    setupTime();
     // Start STA HTTP routes
     http.on("/", HTTP_GET, [](){ sendConfigForm(false); });
     http.on("/form", HTTP_POST, handleFormPost);
@@ -508,6 +561,10 @@ void setup() {
         s["chip"]=chipId.c_str(); s["mode"]="STA"; s["ip"]=WiFi.localIP().toString();
         s["ssid"]=cfg.ssid; s["mqttHost"]=cfg.mqttHost; s["mqttPort"]=cfg.mqttPort;
         s["beacon_mac"] = mac_filtered.c_str(); s["rssi_ema"] = states[mac_filtered].rssi_ema;
+        s["ts_unix"] = (uint32_t) ts_unix_last_sensor_update; s["ts_ms"] = (uint32_t) millis();
+        s["state"]      = mqttStateStr(mqtt.state());   // readable string
+        s["retries"]    = g_mqttRetries;
+        s["next_retry_ms"] = (millis() > g_nextMqttRetryMs) ? 0 : (g_nextMqttRetryMs - millis());
         String body; serializeJson(s, body); http.send(200, "application/json", body);
     });
     http.on("/config", HTTP_POST, [](){
@@ -527,8 +584,8 @@ void setup() {
     //     MDNS.addServiceTxt("_ble-rssi", "_tcp", "id", chipId.c_str());
     // }
     startMDNS();
-    mqttConnect();
     startBLE();
+    mqttConnectRobust();
 }
 
 void loop() {
@@ -544,7 +601,7 @@ void loop() {
 
   http.handleClient();
   if (WiFi.isConnected()) {
-    if (!mqtt.connected()) mqttConnect();
+    if (!mqtt.connected()) mqttConnectRobust();
     mqtt.loop();
   }
 
